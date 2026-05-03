@@ -9,14 +9,15 @@
 1. [Overview](#overview)
 2. [Core Features](#core-features)
 3. [System Architecture](#system-architecture)
-4. [AI Layer Design](#ai-layer-design)
-5. [Pose Library Design](#pose-library-design)
-6. [Low-Latency Design](#low-latency-design)
-7. [Thread Model](#thread-model)
-8. [Provider Abstraction](#provider-abstraction)
-9. [Project Structure](#project-structure)
-10. [Tech Stack](#tech-stack)
-11. [Development vs Production](#development-vs-production)
+4. [API Endpoints](#api-endpoints)
+5. [AI Layer Design](#ai-layer-design)
+6. [Pose Library Design](#pose-library-design)
+7. [Low-Latency Design](#low-latency-design)
+8. [Thread Model](#thread-model)
+9. [Provider Abstraction](#provider-abstraction)
+10. [Project Structure](#project-structure)
+11. [Tech Stack](#tech-stack)
+12. [Development vs Production](#development-vs-production)
 
 ---
 
@@ -24,7 +25,12 @@
 
 Postur is an open-source Android application that uses AI to suggest poses via a white silhouette overlay on the live camera feed. The user mimics the suggested pose while a real-time voice coach powered by an LLM guides them to match it precisely.
 
-The app is designed with a **dual AI backend** — it runs against a local Ollama instance during development (free, fast, private) and switches to Gemini Flash API for production (low cost, scalable).
+The system is split into two components:
+
+- **Android App (Kotlin)** — handles camera, real-time pose detection, overlay rendering, and voice playback
+- **Python Backend (FastAPI)** — handles all AI logic, prompt engineering, and LLM provider switching
+
+This separation keeps Android code clean and makes the AI layer independently testable and deployable.
 
 ---
 
@@ -32,77 +38,181 @@ The app is designed with a **dual AI backend** — it runs against a local Ollam
 
 | Feature | Description |
 |---|---|
-| Scene Analysis | Gemini Vision / Ollama Vision analyzes the camera frame and selects an appropriate pose category |
-| Pose Suggestion | A curated JSON pose library provides skeleton keypoints; LLM decides placement, rotation, and mirroring |
-| Silhouette Overlay | White skeleton drawn on live camera feed using Android Canvas, powered by MediaPipe keypoints |
-| Real-Time Evaluation | MediaPipe compares user's live skeleton against the target pose, calculating match % per body part |
-| Voice Coach | Hybrid rule engine + LLM generates natural language corrections; Android TTS speaks them aloud |
-| Prefetching | Next pose is always fetched in the background so switching poses is instant |
-| Local-First | Runs against Mac Mini (Ollama) on LAN during dev; falls back to Gemini Flash automatically |
+| Scene Analysis | Vision model analyzes a camera frame and selects an appropriate pose category |
+| Pose Suggestion | Curated JSON pose library + LLM decides placement, rotation, and mirroring |
+| Silhouette Overlay | White skeleton drawn on live camera feed using Android Canvas + MediaPipe |
+| Real-Time Evaluation | MediaPipe compares user's live skeleton against target pose, calculating match % |
+| Voice Coach | Hybrid rule engine + LLM generates natural language corrections spoken via TTS |
+| Prefetching | Next pose always fetched in background so switching is instant |
+| Local-First | FastAPI backend talks to Ollama (dev) or Gemini Flash (prod) automatically |
 
 ---
 
 ## System Architecture
 
 ```
-User Opens App
-      │
-      ▼
-┌─────────────────────────────────────────────────┐
-│               POSTUR ANDROID APP                │
-│                                                 │
-│  ┌──────────────┐    ┌───────────────────────┐  │
-│  │ CameraX      │    │ AI Service Layer      │  │
-│  │ (live feed)  │    │ (provider abstracted) │  │
-│  └──────┬───────┘    └──────────┬────────────┘  │
-│         │                       │               │
-│         ▼                       ▼               │
-│  ┌──────────────┐    ┌───────────────────────┐  │
-│  │ MediaPipe    │    │ OllamaProvider   OR   │  │
-│  │ Pose         │    │ GeminiProvider        │  │
-│  │ Landmarker   │    │ (same interface)      │  │
-│  └──────┬───────┘    └──────────┬────────────┘  │
-│         │                       │               │
-│         ▼                       ▼               │
-│  ┌──────────────────────────────────────────┐   │
-│  │           Pose Overlay Engine            │   │
-│  │  • Draws white silhouette on Canvas      │   │
-│  │  • Draws live user skeleton              │   │
-│  │  • Calculates match % (every 100ms)      │   │
-│  └──────────────────┬───────────────────────┘   │
-│                     │                           │
-│                     ▼                           │
-│  ┌──────────────────────────────────────────┐   │
-│  │           Voice Coach Engine             │   │
-│  │  • Rule engine → instant feedback        │   │
-│  │  • LLM → natural language instruction    │   │
-│  │  • TTS → speaks correction aloud         │   │
-│  └──────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────┐
+│               ANDROID APP (Kotlin)                  │
+│                                                     │
+│  CameraX ──► MediaPipe ──► Canvas Overlay           │
+│                  │                                  │
+│                  ▼                                  │
+│           Pose Match Engine                         │
+│                  │                                  │
+│                  ▼                                  │
+│           Voice Coach (TTS)                         │
+│                                                     │
+│  All AI calls → HTTP → FastAPI backend              │
+└────────────────────┬────────────────────────────────┘
+                     │
+                     │  HTTP REST
+                     │  WiFi on dev / Internet on prod
+                     │
+                     ▼
+┌─────────────────────────────────────────────────────┐
+│            FASTAPI BACKEND (Python)                 │
+│                                                     │
+│  POST /analyze-scene     → category + placement     │
+│  GET  /next-pose         → pose keypoints + tip     │
+│  POST /coach-instruction → one coaching sentence    │
+│  GET  /poses             → full pose library        │
+│  GET  /health            → provider status          │
+│                                                     │
+│  Provider abstraction (Ollama ↔ Gemini)             │
+└────────────────────┬────────────────────────────────┘
+                     │
+          ┌──────────┴──────────┐
+          ▼                     ▼
+┌──────────────────┐  ┌──────────────────────┐
+│  Ollama (Dev)    │  │  Gemini Flash (Prod)  │
+│  Mac Mini M4     │  │  Google Cloud API     │
+│  llama3.2-vision │  │  gemini-1.5-flash     │
+│  gemma3:4b       │  │                       │
+└──────────────────┘  └──────────────────────┘
+```
+
+---
+
+## API Endpoints
+
+### `POST /analyze-scene`
+Accepts a base64-encoded camera frame. Returns scene analysis and pose placement.
+
+**Request:**
+```json
+{
+  "image": "base64_encoded_jpeg_string",
+  "current_category": "fitness"
+}
+```
+
+**Response:**
+```json
+{
+  "category": "fitness",
+  "lighting": "good",
+  "setting": "indoor",
+  "subject_count": 1,
+  "suggested_pose_id": "fitness_003",
+  "anchor_zone": "MC",
+  "mirror": false,
+  "rotation_deg": 0,
+  "scale_hint": "full_body",
+  "confidence": 0.91
+}
+```
+
+---
+
+### `GET /next-pose`
+Returns the next pose based on category and current pose ID.
+
+**Query params:** `category=fitness&current_id=fitness_002`
+
+**Response:**
+```json
+{
+  "pose": {
+    "id": "fitness_003",
+    "name": "Warrior Lunge",
+    "category": "fitness",
+    "difficulty": "medium",
+    "keypoints": { "..." : "..." },
+    "tip": "Step forward into a deep lunge, keep front knee above ankle"
+  },
+  "placement": {
+    "anchor_zone": "MC",
+    "mirror": false,
+    "rotation_deg": 5,
+    "scale_hint": "full_body"
+  }
+}
+```
+
+---
+
+### `POST /coach-instruction`
+Accepts mismatch data. Returns one natural coaching instruction.
+
+**Request:**
+```json
+{
+  "mismatches": [
+    { "landmark": "left_elbow", "angle_diff_deg": 35 },
+    { "landmark": "right_knee", "angle_diff_deg": 20 }
+  ],
+  "pose_id": "fitness_003"
+}
+```
+
+**Response:**
+```json
+{
+  "instruction": "Try bending your left arm a bit more",
+  "source": "llm"
+}
+```
+
+---
+
+### `GET /poses`
+Returns the full pose library, optionally filtered by category.
+
+**Query params:** `category=portrait` (optional)
+
+---
+
+### `GET /health`
+Returns backend status and active AI provider.
+
+**Response:**
+```json
+{
+  "status": "ok",
+  "provider": "ollama",
+  "ollama_reachable": true,
+  "models": ["llama3.2-vision", "gemma3:4b"]
+}
 ```
 
 ---
 
 ## AI Layer Design
 
-Postur uses three distinct AI systems, each with a specific responsibility:
-
 ### 1. Vision Model — Scene Understanding
-- **Trigger:** Once on app open, or when user taps "Rescan Scene"
-- **Input:** Single camera frame (JPEG snapshot)
-- **Output:** Structured JSON with pose category, lighting quality, subject count
-- **Dev backend:** `llama3.2-vision:11b` via Ollama
-- **Prod backend:** Gemini 1.5 Flash Vision
+- **Trigger:** Once on app open, or on user request
+- **Input:** Single JPEG frame (base64)
+- **Dev model:** `llama3.2-vision:11b` via Ollama
+- **Prod model:** `gemini-1.5-flash` (Vision)
 
 **Prompt:**
 ```
 Analyze this scene. Detect lighting quality, background type,
-number of people, indoor or outdoor setting.
-Suggest a pose category from: [fitness, portrait, casual, group].
+number of people, and whether it is indoor or outdoor.
 
 Return ONLY this JSON:
 {
-  "category": "...",
+  "category": "fitness | portrait | casual | group",
   "lighting": "good | low | harsh",
   "setting": "indoor | outdoor",
   "subject_count": 1,
@@ -112,33 +222,27 @@ Return ONLY this JSON:
 
 ---
 
-### 2. MediaPipe Pose Landmarker — Real-Time On-Device
-- **Trigger:** Every camera frame (60fps)
-- **Output:** 33 body landmark coordinates (x, y, z, visibility)
-- **Usage:** Draw user skeleton overlay + calculate pose match %
-- **Runs:** 100% on-device, no network, no cost
-- **Key landmarks used:** shoulders, elbows, wrists, hips, knees, ankles
+### 2. MediaPipe Pose Landmarker — On-Device Real-Time
+- **Runs:** 100% on Android device, no network, no cost
+- **Output:** 33 body landmark coordinates per frame
+- **Used for:** Silhouette overlay + pose match % calculation
 
 ---
 
-### 3. LLM — Pose Placement + Voice Coaching
-
-#### Pose Placement (once per pose)
-- **Input:** Scene analysis result + selected pose ID
-- **Output:** Placement instructions for the skeleton overlay
+### 3. LLM — Pose Placement
 
 **Prompt:**
 ```
-Scene: indoor, good lighting, single person, center of frame, facing forward.
+Scene: indoor, good lighting, single person, center of frame.
 Pose category: fitness.
-Selected pose: fitness_003 (Power Stance).
+Selected pose: fitness_003 (Warrior Lunge).
 
 Return ONLY this JSON:
 {
-  "anchor_zone": "MC",
+  "anchor_zone": "MC | ML | MR | TC | BC | TL | TR | BL | BR",
   "mirror": false,
-  "rotation_deg": 0,
-  "scale_hint": "full_body",
+  "rotation_deg": -15 to 15,
+  "scale_hint": "full_body | upper_body | lower_body",
   "tip": "one short pose tip for the user"
 }
 ```
@@ -154,27 +258,25 @@ Return ONLY this JSON:
 └──────┴──────┴──────┘
 ```
 
-#### Voice Coaching (every 3-4 seconds when mismatch detected)
-- **Input:** Which body parts are misaligned + by how much
-- **Output:** One short natural language correction instruction
-- **Dev backend:** `gemma3:4b` via Ollama
-- **Prod backend:** Gemini 1.5 Flash
+---
+
+### 4. LLM — Voice Coaching
 
 **Prompt:**
 ```
-The user is trying to match a pose. These body parts are off:
-- Left elbow: 35° off target
-- Right knee: 20° off target
+The user is matching a pose. These body parts are misaligned:
+- left_elbow: 35° off target
+- right_knee: 20° off target
 
-Generate ONE short, friendly correction instruction (max 10 words).
-Return only the instruction text, nothing else.
+Generate ONE short, friendly correction (max 10 words).
+Return only the instruction text.
 ```
 
 ---
 
 ## Pose Library Design
 
-Poses are stored as a local JSON file bundled with the app.
+Poses are stored in `backend/data/poses.json` and served by the FastAPI backend.
 
 ```json
 {
@@ -183,6 +285,7 @@ Poses are stored as a local JSON file bundled with the app.
   "category": "fitness",
   "difficulty": "easy",
   "tags": ["standing", "full_body", "symmetrical"],
+  "default_tip": "Stand tall, feet wider than shoulders",
   "keypoints": {
     "left_shoulder":  [0.30, 0.35],
     "right_shoulder": [0.70, 0.35],
@@ -196,53 +299,45 @@ Poses are stored as a local JSON file bundled with the app.
     "right_knee":     [0.65, 0.78],
     "left_ankle":     [0.35, 0.95],
     "right_ankle":    [0.65, 0.95]
-  },
-  "default_tip": "Stand tall, feet wider than shoulders"
+  }
 }
 ```
 
-**Keypoints are normalized coordinates** (0.0 to 1.0 relative to frame). The Pose Overlay Engine converts these to actual pixel coordinates using the person's bounding box from MediaPipe.
+Keypoints are **normalized coordinates** (0.0–1.0 relative to frame). The Android app converts these to pixel coordinates using MediaPipe's bounding box.
 
-**MVP target:** 30–50 poses across 3 categories (fitness, portrait, casual).
+**MVP target:** 30 poses across 3 categories (fitness, portrait, casual).
 
 ---
 
 ## Low-Latency Design
 
-### Guiding Principle
+### Core Principle
 > The camera thread is sacred. Nothing blocks it. Ever.
 
 ### Strategy Per Operation
 
-| Operation | Strategy | Result |
+| Operation | Strategy | Target |
 |---|---|---|
-| App startup | Show default pose instantly, analyze scene in background | Zero perceived wait |
-| Pose switching | Always prefetch next pose | ~0ms switch time |
+| App startup | Show default pose instantly, analyze scene in background | 0ms perceived wait |
+| Pose switching | Always prefetch next pose from backend | ~0ms switch |
 | Skeleton overlay | Pure Canvas math, no network | <16ms always |
-| Pose match % | Calculated every 100ms, not every frame | Smooth, no CPU spike |
-| Voice feedback | Rule engine first (instant), LLM second (async) | <100ms first response |
+| Pose match % | Calculated every 100ms via timer | Smooth, no CPU spike |
+| Voice feedback | Rule engine first (instant), LLM second (async) | <100ms first sound |
 | TTS playback | Pre-warm 20 common phrases on startup | Instant audio |
-| AI provider | Ping Mac Mini on startup, fallback to Gemini | Seamless switching |
+| Backend routing | Ping Ollama on startup, fallback to Gemini | Seamless |
 
 ### Prefetch Flow
 ```
-User is on Pose N
-      │
-      ├── [Background] Fetch Pose N+1 keypoints
-      ├── [Background] Get LLM placement for Pose N+1
-      └── [Background] Generate tip for Pose N+1
-
-User taps Next
-      │
-      └── [Instant] Display already-loaded Pose N+1
+User on Pose N
+├── [Background] GET /next-pose → preload Pose N+1
+└── User taps Next → Pose N+1 displays instantly
 ```
 
 ### Voice Coach Hybrid Pipeline
 ```
 Mismatch detected
-      │
-      ├── [0ms]    Rule engine → instant phrase → TTS cache → play
-      └── [async]  LLM call → better instruction → queue for next cycle
+├── [0ms]    Rule engine → instant phrase → TTS cache → play
+└── [async]  POST /coach-instruction → LLM → better phrase → queue next
 ```
 
 ---
@@ -250,61 +345,67 @@ Mismatch detected
 ## Thread Model
 
 ```
-┌─────────────────────────────────────────────────────┐
-│  LANE 1 — Camera Thread (60fps, never blocked)      │
-│  • CameraX frame capture                            │
-│  • MediaPipe pose detection                         │
-│  • Canvas draw: target silhouette + user skeleton   │
-│  • Reads shared state (never writes to AI layer)    │
-├─────────────────────────────────────────────────────┤
-│  LANE 2 — AI Coroutine (background, Dispatchers.IO) │
-│  • Scene analysis (once on open)                    │
-│  • Pose selection + placement                       │
-│  • Voice coach LLM calls (throttled, 3-4s min gap) │
-│  • Prefetch next pose                               │
-│  • Writes results to shared StateFlow               │
-├─────────────────────────────────────────────────────┤
-│  LANE 3 — Audio Thread                              │
-│  • TTS queue management                             │
-│  • Pre-warmed audio cache playback                  │
-│  • Enforces cooldown between instructions           │
-└─────────────────────────────────────────────────────┘
+LANE 1 — Camera Thread (60fps, never blocked)
+  CameraX → MediaPipe → Canvas draw (silhouette + user skeleton)
+  Reads shared StateFlow. Never makes network calls.
+
+LANE 2 — AI Coroutine (Dispatchers.IO, background)
+  Scene analysis  → POST /analyze-scene
+  Pose prefetch   → GET  /next-pose
+  Coach feedback  → POST /coach-instruction (throttled, 3-4s gap)
+  Writes results to shared StateFlow.
+
+LANE 3 — Audio Thread
+  TTS queue management
+  Pre-warmed audio cache playback
+  Enforces cooldown between spoken instructions
 ```
 
-Lanes communicate via **Kotlin StateFlow** — Lane 2 updates, Lane 1 observes. No direct calls between lanes.
+Lanes communicate exclusively via **Kotlin StateFlow**. No direct cross-lane calls.
 
 ---
 
 ## Provider Abstraction
 
-The entire AI backend is hidden behind a single interface. The app never calls Ollama or Gemini directly.
+All AI logic lives in Python behind a clean abstract interface.
 
-```kotlin
-interface AIProvider {
-    suspend fun analyzeScene(frame: Bitmap): SceneResult
-    suspend fun getPosePlacement(poseId: String, scene: SceneResult): PlacementResult
-    suspend fun getPoseTip(poseId: String): String
-    suspend fun getCoachingInstruction(mismatch: PoseMismatch): String
-}
+```python
+# backend/providers/base.py
+from abc import ABC, abstractmethod
+
+class AIProvider(ABC):
+
+    @abstractmethod
+    async def analyze_scene(self, image_base64: str) -> dict:
+        pass
+
+    @abstractmethod
+    async def get_pose_placement(self, pose_id: str, scene: dict) -> dict:
+        pass
+
+    @abstractmethod
+    async def get_coaching_instruction(self, mismatches: list) -> str:
+        pass
 ```
 
-```kotlin
-// Factory picks the right provider at runtime
-object AIProviderFactory {
-    suspend fun create(): AIProvider {
-        return if (isMacMiniReachable()) {
-            OllamaProvider(baseUrl = BuildConfig.OLLAMA_URL)
-        } else {
-            GeminiProvider(apiKey = BuildConfig.GEMINI_API_KEY)
-        }
-    }
-}
+```python
+# backend/providers/__init__.py
+import httpx
+from .ollama import OllamaProvider
+from .gemini import GeminiProvider
+
+async def get_provider() -> AIProvider:
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            r = await client.get("http://localhost:11434/api/tags")
+            if r.status_code == 200:
+                return OllamaProvider()
+    except Exception:
+        pass
+    return GeminiProvider()
 ```
 
-This means:
-- Development uses Ollama (free, fast on LAN)
-- Production uses Gemini Flash (cheap, scalable)
-- Open source users can plug in any backend
+The Android app calls one URL. It never knows whether Ollama or Gemini is behind it.
 
 ---
 
@@ -312,36 +413,44 @@ This means:
 
 ```
 postur/
-├── app/
-│   └── src/main/
-│       ├── ai/
-│       │   ├── AIProvider.kt              # Interface contract
-│       │   ├── OllamaProvider.kt          # Local Mac Mini backend
-│       │   ├── GeminiProvider.kt          # Cloud backend
-│       │   ├── AIProviderFactory.kt       # Runtime provider selection
-│       │   └── models/
-│       │       ├── SceneResult.kt
-│       │       ├── PlacementResult.kt
-│       │       └── PoseMismatch.kt
+│
+├── android/                           ← Kotlin Android app
+│   └── app/src/main/
 │       ├── camera/
-│       │   ├── CameraManager.kt           # CameraX setup
-│       │   └── FrameAnalyzer.kt           # MediaPipe integration
+│       │   ├── CameraManager.kt
+│       │   └── FrameAnalyzer.kt
 │       ├── pose/
-│       │   ├── PoseLibrary.kt             # JSON loader
-│       │   ├── PoseOverlayEngine.kt       # Canvas drawing
-│       │   ├── PoseMatchCalculator.kt     # Match % logic
-│       │   └── PosePrefetcher.kt          # Background prefetch
+│       │   ├── PoseOverlayEngine.kt
+│       │   ├── PoseMatchCalculator.kt
+│       │   └── PosePrefetcher.kt
 │       ├── coach/
-│       │   ├── VoiceCoach.kt              # Orchestrator
-│       │   ├── RuleEngine.kt              # Instant rule-based feedback
-│       │   └── TTSManager.kt              # Android TTS + cache
-│       ├── ui/
-│       │   ├── camera/CameraScreen.kt     # Main screen
-│       │   ├── capture/CaptureScreen.kt   # Photo saved screen
-│       │   └── settings/SettingsScreen.kt
-│       └── assets/
-│           └── poses.json                 # Pose library
-├── ARCHITECTURE.md                        # This document
+│       │   ├── VoiceCoach.kt
+│       │   ├── RuleEngine.kt
+│       │   └── TTSManager.kt
+│       ├── network/
+│       │   └── PosturApiClient.kt     ← all HTTP calls to FastAPI
+│       └── ui/
+│           ├── CameraScreen.kt
+│           ├── CaptureScreen.kt
+│           └── SettingsScreen.kt
+│
+├── backend/                           ← Python FastAPI server
+│   ├── main.py                        ← app entry point
+│   ├── config.py                      ← env config
+│   ├── routes/
+│   │   ├── scene.py                   ← /analyze-scene
+│   │   ├── pose.py                    ← /next-pose, /poses
+│   │   └── coach.py                   ← /coach-instruction
+│   ├── providers/
+│   │   ├── base.py                    ← abstract AIProvider
+│   │   ├── ollama.py                  ← Ollama implementation
+│   │   └── gemini.py                  ← Gemini implementation
+│   ├── data/
+│   │   └── poses.json                 ← pose library
+│   ├── .env.example
+│   └── requirements.txt
+│
+├── ARCHITECTURE.md
 ├── README.md
 ├── .gitignore
 └── LICENSE (MIT)
@@ -351,6 +460,7 @@ postur/
 
 ## Tech Stack
 
+### Android
 | Component | Technology |
 |---|---|
 | Language | Kotlin |
@@ -358,12 +468,22 @@ postur/
 | Camera | CameraX |
 | Pose Detection | MediaPipe Pose Landmarker |
 | Overlay Drawing | Android Canvas |
-| AI (Dev) | Ollama — llama3.2-vision + gemma3:4b |
-| AI (Prod) | Gemini 1.5 Flash API |
+| HTTP Client | Retrofit + OkHttp |
 | Async | Kotlin Coroutines + StateFlow |
 | TTS | Android TextToSpeech |
-| DI | Hilt |
-| Build | Gradle (Kotlin DSL) |
+| Dependency Injection | Hilt |
+
+### Backend
+| Component | Technology |
+|---|---|
+| Language | Python 3.11+ |
+| Framework | FastAPI |
+| HTTP Client | httpx (async) |
+| AI — Dev | Ollama (llama3.2-vision + gemma3:4b) |
+| AI — Prod | Google Gemini 1.5 Flash API |
+| Image Handling | Pillow |
+| Config | python-dotenv |
+| Server | Uvicorn |
 
 ---
 
@@ -371,15 +491,40 @@ postur/
 
 | Aspect | Development | Production |
 |---|---|---|
-| AI Backend | Ollama on Mac Mini M4 (LAN) | Gemini 1.5 Flash API |
-| Cost | ₹0 | Very low (Flash is cheap) |
-| Latency | 10–50ms (LAN) | 200–400ms (internet) |
-| Config | `OLLAMA_URL` in local.properties | `GEMINI_API_KEY` in local.properties |
-| Switch | Automatic (ping-based) | Automatic fallback |
+| Backend runs on | Mac Mini M4 (local) | Cloud server / VPS |
+| AI provider | Ollama (auto-detected) | Gemini 1.5 Flash |
+| Android API URL | `http://[mac-ip]:8000` | `https://api.postur.app` |
+| Cost | ₹0 | Very low (Gemini Flash) |
+| Config | `.env` file in `/backend` | Environment variables |
 
-**For open source contributors:** Clone the repo, run Ollama locally, set `OLLAMA_URL=http://localhost:11434` in `local.properties`, and develop for free with no API keys needed.
+### Local Dev Setup
+```bash
+# Clone the repo
+git clone https://github.com/yokesh-mp/postur.git
+cd postur/backend
+
+# Install Python dependencies
+pip install -r requirements.txt
+
+# Configure environment
+cp .env.example .env
+# Edit .env → add GEMINI_API_KEY if not using Ollama
+
+# Start Ollama (optional, for free local AI)
+OLLAMA_HOST=0.0.0.0 ollama serve
+
+# Pull required models
+ollama pull llama3.2-vision
+ollama pull gemma3:4b
+
+# Run the backend
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
+
+# Open android/ in Android Studio
+# Set BASE_URL=http://[your-mac-ip]:8000 in local.properties
+```
 
 ---
 
-*Document version: 0.1 — Initial architecture design*
+*Document version: 0.2 — Added Python FastAPI backend*
 *App version: pre-alpha*
